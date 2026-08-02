@@ -1,157 +1,153 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <time.h>
 #include <TFT_eSPI.h>
-#include <NimBLEDevice.h>
 #include "Adafruit_SHT31.h"
+#include "SparkFun_SCD4x_Arduino_Library.h"
+#include "secrets.h"
 
-TFT_eSPI tft = TFT_eSPI();
+// Doi thanh 0 de chay khong can man (luc thao man ra cho do nhay nguon).
+// Toan bo code ve man van nam nguyen trong file, chi khong duoc bien dich.
+#define USE_TFT 1
+
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
+SCD4x scd4x;
+
+#if USE_TFT
+TFT_eSPI tft = TFT_eSPI();
+#endif
 
 // ---------------- cau hinh ----------------
 #define SDA_PIN 8
 #define SCL_PIN 9
 
-#define DATA_TIMEOUT 15000UL
-#define SENSOR_INTERVAL 10000UL
-#define RETRY_INTERVAL 5000UL
+#define SHT_INTERVAL 10000UL    // doc SHT3X 10s/lan
+#define SENSOR_RETRY 5000UL     // thu ket noi lai cam bien hong
+#define CO2_STALE 120000UL      // SCD40 che do low power tra so 30s/lan,
+                                // nen nguong nay phai > 30s nhieu lan
+#define UPLOAD_INTERVAL 60000UL // server coi qua 3 phut khong co tin la offline
+#define UPLOAD_RETRY 15000UL    // gui that bai thi thu lai sau bao lau
+#define UPLOAD_MAX_TRY 3        // het so lan nay thi bo goi do, cho nhip sau
+
+#define NTP_TZ "ICT-7"        // POSIX TZ cua VN, dau am nghia la UTC+7
+#define TIME_VALID 1700000000 // moc de biet dong ho da dong bo hay chua
 
 // ---------------- bang mau (RGB565) ----------------
-#define C_BG 0x0862     // #0A0E13 nen gan den, hoi ngA xanh
-#define C_CARD 0x10C4   // #141A22 nen the
-#define C_LINE 0x2146   // #202B36 vien / rANH truot
+#define C_BG 0x0862     // #0A0E13
+#define C_CARD 0x10C4   // #141A22
+#define C_LINE 0x2146   // #202B36
 #define C_TEXT 0xE77E   // #E6EDF3
 #define C_DIM 0x7C53    // #7D8B99
-#define C_CYAN 0x3DFF   // #38BDF8  CPU
-#define C_VIOLET 0xA45F // #A78BFA  GPU
-#define C_GREEN 0x4EF0  // #4ADE80  RAM
-#define C_AMBER 0xFDE4  // #FBBF24  phong
-#define C_RED 0xFB8E    // #F87171  canh bao
+#define C_CYAN 0x3DFF   // #38BDF8
+#define C_GREEN 0x4EF0  // #4ADE80
+#define C_AMBER 0xFDE4  // #FBBF24
+#define C_ORANGE 0xFC87 // #FB923C
+#define C_RED 0xFB8E    // #F87171
 
-// ---------------- toa do ----------------
+// ---------------- toa do (man 320x240, xoay ngang) ----------------
 #define HDR_H 24
 
-#define CARD_Y 30
-#define CARD_H 116
-#define CARD_A_X 6
-#define CARD_B_X 164
-#define CARD_W 150
+#define CO2_X 6
+#define CO2_Y 28
+#define CO2_W 308
+#define CO2_H 110
+#define CO2_CX 160
+#define CO2_CY 92 // tam so lon (font 8 cao 75px -> 54..130)
 
-#define GA_DX 75 // tam dong ho, tinh tu goc trai the
-#define GA_DY 66
-#define GA_R 40
-#define GA_IR 31
-#define ARC_FROM 30
-#define ARC_TO 330
+#define BOT_Y 144
+#define BOT_H 90
+#define BOT_W 150
+#define TP_X 6
+#define HM_X 164
+#define TP_CX (TP_X + BOT_W / 2)
+#define HM_CX (HM_X + BOT_W / 2)
+#define BOT_CY (BOT_Y + 50) // font 6 cao 48px -> 170..218
 
-#define LIST_X 6
-#define LIST_Y 152
-#define LIST_W 308
-#define LIST_H 84
-#define ROW0_Y 160
-#define ROW_DY 26
-#define BAR_X 72
-#define BAR_W 148
-#define BAR_H 8
+// ---------------- trang thai cam bien ----------------
+bool shtOk = false;
+bool scdOk = false;
+uint8_t shtAddr = 0x44;
 
-// ---------------- trang thai ----------------
-struct Stats
+float roomTemp = NAN, roomHum = NAN; // tu SHT3X -> mainTemp / mainHumidity
+float co2Temp = NAN, co2Hum = NAN;   // tu chinh SCD40 -> co2Temp / co2Humidity
+int co2 = -1;
+
+unsigned long lastShtRead = 0;
+unsigned long lastCo2Ok = 0;
+unsigned long lastSensorRetry = 0;
+
+// ---------------- trang thai mang ----------------
+enum NetState
 {
-    float cpu = 0, cpuTemp = 0;
-    float ramUsed = 0, ramTotal = 0;
-    bool hasGpu = false;
-    float gpu = 0, gpuTemp = 0, gpuWatt = 0;
-    float vramUsed = 0, vramTotal = 0;
+    NET_DOWN,  // chua co WiFi
+    NET_UP,    // co WiFi nhung lan gui gan nhat that bai
+    NET_SYNCED // lan gui gan nhat thanh cong
 };
 
-Stats st;
-bool linkUp = false;
-unsigned long lastData = 0;
+NetState netState = NET_DOWN;
+unsigned long lastWifiTry = 0;
+unsigned long lastUpload = 0;
+unsigned long lastUploadTry = 0;
 
-bool sensorOk = false;
-uint8_t sensorAddr = 0x44;
-float roomTemp = NAN, roomHum = NAN;
-unsigned long lastSensorRead = 0;
-unsigned long lastRetry = 0;
-
-// nho lai gia tri da ve de khong ve lai cung tron khi khong doi
-int prevCpuPct = -2, prevGpuPct = -2;
-bool prevLink = false, prevSensor = false;
-
-// ---------------- tien ich ve ----------------
-uint16_t loadColor(float pct, uint16_t base)
+// Goi dang cho gui. Chup lai gia tri tai thoi diem lay mau, KHONG doc lai
+// bien toan cuc luc retry — de recordedAt va so lieu luon di cung nhau.
+struct Payload
 {
-    return pct >= 85.0f ? C_RED : base;
+    bool active = false;
+    uint8_t tries = 0;
+    time_t ts = 0; // 0 = chua co NTP -> de server tu dat gio
+    bool hasCo2 = false;
+    bool hasCo2Env = false;
+    bool hasSht = false;
+    int co2 = 0;
+    float co2Temp = 0, co2Hum = 0;
+    float temp = 0, hum = 0;
+    int rssi = 0;
+};
+
+Payload pending;
+
+// nho gia tri da ve de khong ve lai khi khong doi
+int prevCo2 = -2;
+int prevTempX10 = -9999;
+int prevHum = -2;
+bool prevSensorHealthy = false;
+NetState prevNet = (NetState)-1;
+
+// ---------------- danh gia muc CO2 ----------------
+uint16_t co2Color(int v)
+{
+    if (v < 0)
+        return C_DIM;
+    if (v < 800)
+        return C_GREEN;
+    if (v < 1200)
+        return C_AMBER;
+    if (v < 1800)
+        return C_ORANGE;
+    return C_RED;
 }
 
-// Dong ho cung tron. pct < 0 nghia la khong co du lieu -> chi ve rANH truot.
-void drawGauge(int cx, int cy, float pct, uint16_t color)
+const char *co2Label(int v)
 {
-    if (pct > 100.0f)
-        pct = 100.0f;
-
-    if (pct < 0.0f)
-    {
-        tft.drawSmoothArc(cx, cy, GA_R, GA_IR, ARC_FROM, ARC_TO, C_LINE, C_CARD, true);
-        return;
-    }
-
-    int mid = ARC_FROM + (int)((ARC_TO - ARC_FROM) * pct / 100.0f + 0.5f);
-    if (mid > ARC_FROM)
-        tft.drawSmoothArc(cx, cy, GA_R, GA_IR, ARC_FROM, mid, color, C_CARD, true);
-    if (mid < ARC_TO)
-        tft.drawSmoothArc(cx, cy, GA_R, GA_IR, mid, ARC_TO, C_LINE, C_CARD, true);
+    if (v < 0)
+        return "";
+    if (v < 800)
+        return "THOANG";
+    if (v < 1200)
+        return "HOI BI";
+    if (v < 1800)
+        return "NGOP";
+    return "MO CUA!";
 }
 
-void drawCenterText(int cx, int cy, const char *big, const char *small, uint16_t color)
-{
-    tft.setTextDatum(MC_DATUM);
+// ================= PHAN VE MAN =================
+#if USE_TFT
 
-    tft.setTextFont(4);
-    tft.setTextColor(color, C_CARD);
-    tft.setTextPadding(58);
-    tft.drawString(big, cx, cy - 6);
-
-    tft.setTextFont(2);
-    tft.setTextColor(C_DIM, C_CARD);
-    tft.setTextPadding(46);
-    tft.drawString(small, cx, cy + 20);
-
-    tft.setTextPadding(0);
-}
-
-// Thanh bo goc: ve phan day roi ve phan con lai, khong xoa truoc -> khong nhay
-void drawBar(int y, float pct, uint16_t color, bool active)
-{
-    if (pct < 0)
-        pct = 0;
-    if (pct > 100)
-        pct = 100;
-
-    int fill = active ? (int)(BAR_W * pct / 100.0f + 0.5f) : 0;
-    if (fill < BAR_H)
-        fill = active && pct > 0 ? BAR_H : 0; // qua ngan thi bo goc se vo hinh
-
-    tft.fillRoundRect(BAR_X, y, BAR_W, BAR_H, BAR_H / 2, C_LINE);
-    if (fill > 0)
-        tft.fillRoundRect(BAR_X, y, fill, BAR_H, BAR_H / 2, color);
-}
-
-void drawListRow(int idx, const char *value, float pct, uint16_t color, bool active)
-{
-    int y = ROW0_Y + idx * ROW_DY;
-
-    tft.setTextFont(2);
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(active ? C_TEXT : C_DIM, C_CARD);
-    tft.setTextPadding(84);
-    tft.drawString(value, 304, y);
-    tft.setTextPadding(0);
-
-    drawBar(y + 5, pct, color, active);
-}
-
-// ---------------- khung tinh, chi ve mot lan ----------------
 void drawChrome()
 {
     tft.fillScreen(C_BG);
@@ -160,36 +156,51 @@ void drawChrome()
     tft.setTextFont(2);
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(C_CYAN, C_CARD);
-    tft.drawString("PC MONITOR", 10, 3);
+    tft.drawString("KHONG KHI", 10, 3);
 
-    // hai the dong ho
-    tft.fillRoundRect(CARD_A_X, CARD_Y, CARD_W, CARD_H, 8, C_CARD);
-    tft.fillRoundRect(CARD_B_X, CARD_Y, CARD_W, CARD_H, 8, C_CARD);
+    tft.fillRoundRect(CO2_X, CO2_Y, CO2_W, CO2_H, 8, C_CARD);
+    tft.fillRoundRect(TP_X, BOT_Y, BOT_W, BOT_H, 8, C_CARD);
+    tft.fillRoundRect(HM_X, BOT_Y, BOT_W, BOT_H, 8, C_CARD);
 
     tft.setTextColor(C_DIM, C_CARD);
     tft.setTextDatum(TL_DATUM);
-    tft.drawString("CPU", CARD_A_X + 10, CARD_Y + 5);
-    tft.drawString("GPU", CARD_B_X + 10, CARD_Y + 5);
-
-    // the danh sach
-    tft.fillRoundRect(LIST_X, LIST_Y, LIST_W, LIST_H, 8, C_CARD);
-
-    const char *labels[] = {"RAM", "VRAM", "PHONG"};
-    for (int i = 0; i < 3; i++)
-    {
-        tft.setTextColor(C_DIM, C_CARD);
-        tft.setTextDatum(TL_DATUM);
-        tft.drawString(labels[i], 16, ROW0_Y + i * ROW_DY);
-    }
+    tft.drawString("CO2  ppm", CO2_X + 12, CO2_Y + 6);
+    tft.drawString("NHIET DO  C", TP_X + 12, BOT_Y + 6);
+    tft.drawString("DO AM  %", HM_X + 12, BOT_Y + 6);
 }
 
-// ---------------- phan dong ----------------
+void drawNetIndicator()
+{
+    uint16_t col = netState == NET_SYNCED ? C_GREEN
+                   : netState == NET_UP   ? C_AMBER
+                                          : C_RED;
+    const char *txt = netState == NET_SYNCED ? "GUI OK"
+                      : netState == NET_UP   ? "LOI GUI"
+                                             : "MAT WIFI";
+
+    tft.setTextFont(2);
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(col, C_CARD);
+    tft.setTextPadding(80);
+    tft.drawString(txt, 220, 3);
+    tft.setTextPadding(0);
+}
+
 void drawStatusPill()
 {
-    uint16_t col = linkUp ? C_GREEN : C_RED;
+    bool healthy = shtOk && scdOk && co2 >= 0;
+    uint16_t col = healthy ? C_GREEN : C_RED;
+    const char *txt;
 
-    // Ve lai ca vien pill moi lan -> khong can setTextPadding, tranh chuyen
-    // o nen cua chu (cao 16px) de len chinh duong vien cua pill.
+    if (healthy)
+        txt = "CB OK";
+    else if (!scdOk)
+        txt = "LOI CO2";
+    else if (!shtOk)
+        txt = "LOI SHT";
+    else
+        txt = "DANG DO";
+
     tft.fillRoundRect(228, 2, 84, 20, 9, C_CARD);
     tft.drawRoundRect(228, 2, 84, 20, 9, col);
     tft.fillCircle(240, 12, 3, col);
@@ -198,89 +209,127 @@ void drawStatusPill()
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(col, C_CARD);
     tft.setTextPadding(0);
-    // MC_DATUM lay y lam TAM chu, nen phai la 12 (giua pill), khong phai 3
-    tft.drawString(linkUp ? "BLE OK" : "NO LINK", 278, 12);
+    tft.drawString(txt, 278, 12);
+}
+
+void drawCo2()
+{
+    uint16_t col = co2Color(co2);
+    char buf[8];
+
+    if (co2 >= 0)
+        snprintf(buf, sizeof(buf), "%d", co2);
+    else
+        strcpy(buf, "----");
+
+    // Font 8: 75px, chi co chu so va . - : -> don vi phai de o nhan
+    tft.setTextFont(8);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(col, C_CARD);
+    tft.setTextPadding(250);
+    tft.drawString(buf, CO2_CX, CO2_CY);
+    tft.setTextPadding(0);
+
+    tft.setTextFont(2);
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(col, C_CARD);
+    tft.setTextPadding(90);
+    tft.drawString(co2Label(co2), CO2_X + CO2_W - 12, CO2_Y + 6);
+    tft.setTextPadding(0);
+}
+
+void drawTemp()
+{
+    char buf[8];
+    bool ok = !isnan(roomTemp);
+
+    if (ok)
+        snprintf(buf, sizeof(buf), "%.1f", roomTemp);
+    else
+        strcpy(buf, "--");
+
+    tft.setTextFont(6);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(ok ? C_TEXT : C_DIM, C_CARD);
+    tft.setTextPadding(120);
+    tft.drawString(buf, TP_CX, BOT_CY);
+    tft.setTextPadding(0);
+}
+
+void drawHum()
+{
+    char buf[8];
+    bool ok = !isnan(roomHum);
+
+    if (ok)
+        snprintf(buf, sizeof(buf), "%.0f", roomHum);
+    else
+        strcpy(buf, "--");
+
+    tft.setTextFont(6);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(ok ? C_TEXT : C_DIM, C_CARD);
+    tft.setTextPadding(120);
+    tft.drawString(buf, HM_CX, BOT_CY);
+    tft.setTextPadding(0);
 }
 
 void render(bool force = false)
 {
-    char big[16], sub[16], val[24];
-
-    if (force || linkUp != prevLink)
+    bool healthy = shtOk && scdOk && co2 >= 0;
+    if (force || healthy != prevSensorHealthy)
     {
         drawStatusPill();
-        prevLink = linkUp;
+        prevSensorHealthy = healthy;
     }
 
-    // ----- dong ho CPU -----
-    int cpuPct = linkUp ? (int)(st.cpu + 0.5f) : -1;
-    if (force || cpuPct != prevCpuPct)
+    if (force || netState != prevNet)
     {
-        drawGauge(CARD_A_X + GA_DX, CARD_Y + GA_DY, linkUp ? st.cpu : -1.0f,
-                  loadColor(st.cpu, C_CYAN));
-        prevCpuPct = cpuPct;
+        drawNetIndicator();
+        prevNet = netState;
     }
-    if (linkUp)
-    {
-        snprintf(big, sizeof(big), "%.0f%%", st.cpu);
-        snprintf(sub, sizeof(sub), "%.0fC", st.cpuTemp);
-    }
-    else
-    {
-        strcpy(big, "--");
-        strcpy(sub, "");
-    }
-    drawCenterText(CARD_A_X + GA_DX, CARD_Y + GA_DY, big, sub,
-                   linkUp ? C_TEXT : C_DIM);
 
-    // ----- dong ho GPU -----
-    bool gpuOn = linkUp && st.hasGpu;
-    int gpuPct = gpuOn ? (int)(st.gpu + 0.5f) : -1;
-    if (force || gpuPct != prevGpuPct)
+    if (force || co2 != prevCo2)
     {
-        drawGauge(CARD_B_X + GA_DX, CARD_Y + GA_DY, gpuOn ? st.gpu : -1.0f,
-                  loadColor(st.gpu, C_VIOLET));
-        prevGpuPct = gpuPct;
+        drawCo2();
+        prevCo2 = co2;
     }
-    if (gpuOn)
+
+    int tX10 = isnan(roomTemp) ? -9999 : (int)(roomTemp * 10 + 0.5f);
+    if (force || tX10 != prevTempX10)
     {
-        snprintf(big, sizeof(big), "%.0f%%", st.gpu);
-        snprintf(sub, sizeof(sub), "%.0fC %.0fW", st.gpuTemp, st.gpuWatt);
+        drawTemp();
+        prevTempX10 = tX10;
     }
-    else
+
+    int h = isnan(roomHum) ? -2 : (int)(roomHum + 0.5f);
+    if (force || h != prevHum)
     {
-        strcpy(big, "--");
-        strcpy(sub, "");
+        drawHum();
+        prevHum = h;
     }
-    drawCenterText(CARD_B_X + GA_DX, CARD_Y + GA_DY, big, sub,
-                   gpuOn ? C_TEXT : C_DIM);
-
-    // ----- RAM -----
-    float ramPct = st.ramTotal > 0 ? st.ramUsed / st.ramTotal * 100.0f : 0.0f;
-    if (linkUp)
-        snprintf(val, sizeof(val), "%.1f/%.0fG", st.ramUsed, st.ramTotal);
-    else
-        strcpy(val, "---");
-    drawListRow(0, val, ramPct, loadColor(ramPct, C_GREEN), linkUp);
-
-    // ----- VRAM -----
-    float vramPct = st.vramTotal > 0 ? st.vramUsed / st.vramTotal * 100.0f : 0.0f;
-    if (gpuOn)
-        snprintf(val, sizeof(val), "%.1f/%.0fG", st.vramUsed, st.vramTotal);
-    else
-        strcpy(val, "---");
-    drawListRow(1, val, vramPct, loadColor(vramPct, C_VIOLET), gpuOn);
-
-    // ----- phong: doc lap voi ket noi PC -----
-    bool roomOn = sensorOk && !isnan(roomTemp) && !isnan(roomHum);
-    if (roomOn)
-        snprintf(val, sizeof(val), "%.1fC %.0f%%", roomTemp, roomHum);
-    else
-        strcpy(val, "---");
-    drawListRow(2, val, roomOn ? roomHum : 0, C_AMBER, roomOn);
 }
 
-// ---------------- cam bien ----------------
+void initDisplay()
+{
+    // Gan chan cho DUNG instance SPI ma TFT_eSPI dang dung.
+    // Voi USE_HSPI_PORT, thu vien tao rieng mot SPIClass(HSPI) chu khong dung
+    // doi tuong SPI toan cuc -> phai lay qua getSPIinstance().
+    // MISO = -1 de khong chiem GPIO13 (dang lam chan DC).
+    tft.getSPIinstance().begin(TFT_SCLK, -1, TFT_MOSI, -1);
+    tft.init();
+    tft.setRotation(1);
+    drawChrome();
+}
+
+#else // ---- khong dung man: cac ham thanh rong, code goi giu nguyen ----
+
+inline void initDisplay() {}
+inline void render(bool force = false) { (void)force; }
+
+#endif
+
+// ================= CAM BIEN =================
 void scanI2C()
 {
     Serial.println("[I2C] Quet bus...");
@@ -298,24 +347,24 @@ void scanI2C()
         Serial.println("[I2C] Khong thay thiet bi nao -> kiem tra day noi!");
 }
 
-bool initSensor()
+bool initSht()
 {
     if (sht31.begin(0x44))
     {
-        sensorAddr = 0x44;
+        shtAddr = 0x44;
         return true;
     }
     if (sht31.begin(0x45))
     {
-        sensorAddr = 0x45;
+        shtAddr = 0x45;
         return true;
     }
     return false;
 }
 
-bool readSensor()
+bool readSht()
 {
-    if (!sensorOk)
+    if (!shtOk)
         return false;
 
     float t, h;
@@ -326,217 +375,355 @@ bool readSensor()
         return true;
     }
 
-    sensorOk = false;
+    shtOk = false;
     roomTemp = roomHum = NAN;
     Serial.println("[SHT3X] Doc that bai -> se thu ket noi lai");
     return true;
 }
 
-// ---------------- parse du lieu PC ----------------
-void applyKV(const String &k, float v)
+bool initScd()
 {
-    if (k == "cpu")
-        st.cpu = v;
-    else if (k == "ct")
-        st.cpuTemp = v;
-    else if (k == "ram")
-        st.ramUsed = v;
-    else if (k == "ramt")
-        st.ramTotal = v;
-    else if (k == "gpu")
-    {
-        st.gpu = v;
-        st.hasGpu = true;
-    }
-    else if (k == "gt")
-        st.gpuTemp = v;
-    else if (k == "gw")
-        st.gpuWatt = v;
-    else if (k == "vr")
-        st.vramUsed = v;
-    else if (k == "vrt")
-        st.vramTotal = v;
-}
-
-// Dinh dang: cpu=45;ct=52;ram=12.3;ramt=32;gpu=78;gt=65;gw=220;vr=6.2;vrt=12
-bool parseLine(String line)
-{
-    line.trim();
-    if (line.length() == 0)
+    // Tham so thu 2 = false: begin() KHONG tu bat periodic measurement (5s/lan),
+    // de minh tu bat che do low power (30s/lan) ngay duoi.
+    // Tham so thu 3 = true: bat tu hieu chuan ASC.
+    if (!scd4x.begin(Wire, false, true))
         return false;
 
-    st.hasGpu = false;
-    int start = 0, count = 0;
-
-    while (start < (int)line.length())
+    // Low power periodic: 30s/lan, dong trung binh ~3.2mA thay vi ~15mA.
+    // Dong DINH luc do van la ~200mA nhu cu — chi la 30s moi giat mot lan.
+    if (!scd4x.startLowPowerPeriodicMeasurement())
     {
-        int sep = line.indexOf(';', start);
-        if (sep < 0)
-            sep = line.length();
-
-        String tok = line.substring(start, sep);
-        int eq = tok.indexOf('=');
-        if (eq > 0)
-        {
-            applyKV(tok.substring(0, eq), tok.substring(eq + 1).toFloat());
-            count++;
-        }
-        start = sep + 1;
+        Serial.println("[SCD40] Khong bat duoc che do low power");
+        return false;
     }
-    return count > 0;
+
+    Serial.println("[SCD40] OK tai 0x62, low power 30s/lan, cho so dau tien...");
+    return true;
 }
 
-// ---------------- BLE ----------------
-#define BLE_NAME "PC-MONITOR"
-#define SVC_UUID "6e5f0001-b5a3-f393-e0a9-e50e24dcca9e"
-#define CHR_UUID "6e5f0002-b5a3-f393-e0a9-e50e24dcca9e"
-
-volatile bool bleConnected = false;
-volatile bool hasPending = false;
-char rxBuf[160];
-portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
-
-class ServerCB : public NimBLEServerCallbacks
+bool readScd()
 {
-    void onConnect(NimBLEServer *s) override
-    {
-        bleConnected = true;
-        Serial.println("[BLE] PC da ket noi");
-    }
-    void onDisconnect(NimBLEServer *s) override
-    {
-        bleConnected = false;
-        Serial.println("[BLE] PC ngat ket noi -> quang cao lai");
-        NimBLEDevice::startAdvertising();
-    }
-};
+    if (!scdOk)
+        return false;
 
-class CharCB : public NimBLECharacteristicCallbacks
-{
-    // Callback nay chay trong task cua NimBLE, KHONG phai loop().
-    // Ve man tu day se dung SPI tu mot task khac -> chi chep du lieu ra
-    // roi de loop() xu ly.
-    void onWrite(NimBLECharacteristic *c) override
-    {
-        std::string v = c->getValue();
-        if (v.empty() || v.size() >= sizeof(rxBuf))
-            return;
+    // readMeasurement() tu kiem tra co du lieu moi chua, chua co thi tra false
+    if (!scd4x.readMeasurement())
+        return false;
 
-        portENTER_CRITICAL(&rxMux);
-        memcpy(rxBuf, v.data(), v.size());
-        rxBuf[v.size()] = '\0';
-        hasPending = true;
-        portEXIT_CRITICAL(&rxMux);
-    }
-};
+    int v = scd4x.getCO2();
+    if (v <= 0)
+        return false;
 
-void startBLE()
-{
-    NimBLEDevice::init(BLE_NAME);
-    NimBLEDevice::setMTU(247); // du cho mot goi ~70 byte, khong phai chia nho
-
-    NimBLEServer *server = NimBLEDevice::createServer();
-    server->setCallbacks(new ServerCB());
-
-    NimBLEService *svc = server->createService(SVC_UUID);
-    NimBLECharacteristic *chr =
-        svc->createCharacteristic(CHR_UUID, NIMBLE_PROPERTY::WRITE);
-    chr->setCallbacks(new CharCB());
-    svc->start();
-
-    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-    adv->addServiceUUID(SVC_UUID);
-    adv->setScanResponse(true);
-    adv->start();
-
-    Serial.printf("[BLE] Dang quang cao ten \"%s\", MAC %s\n",
-                  BLE_NAME, NimBLEDevice::toString().c_str());
+    co2 = v;
+    // SCD40 co san cam bien nhiet/am, nhung no nam canh phan tu NDIR nong len
+    // nen thuong doc cao hon thuc te 1-3C. Van gui len server de doi chieu,
+    // con so hien tren man va so "chinh" la cua SHT3X.
+    co2Temp = scd4x.getTemperature();
+    co2Hum = scd4x.getHumidity();
+    return true;
 }
 
-// ---------------- main ----------------
+// ================= MANG =================
+bool timeSynced()
+{
+    return time(nullptr) > TIME_VALID;
+}
+
+void startWifi()
+{
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false); // che do ngu tiet kiem dien lam POST hay timeout
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("[WIFI] Dang ket noi toi \"%s\"...\n", WIFI_SSID);
+}
+
+void startNtp()
+{
+    // Bat buoc phai co: vua de kiem han chung chi HTTPS, vua de recordedAt
+    // giu nguyen khi retry (server idempotent theo deviceId + recordedAt).
+    configTzTime(NTP_TZ, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+    Serial.println("[NTP] Da yeu cau dong bo gio");
+}
+
+// Chup lai so lieu hien tai thanh mot goi cho gui
+void snapshot()
+{
+    pending.active = true;
+    pending.tries = 0;
+    pending.ts = timeSynced() ? time(nullptr) : 0;
+
+    pending.hasCo2 = (co2 > 0);
+    pending.co2 = co2;
+
+    pending.hasCo2Env = !isnan(co2Temp) && !isnan(co2Hum);
+    pending.co2Temp = co2Temp;
+    pending.co2Hum = co2Hum;
+
+    pending.hasSht = !isnan(roomTemp) && !isnan(roomHum);
+    pending.temp = roomTemp;
+    pending.hum = roomHum;
+
+    pending.rssi = WiFi.RSSI();
+}
+
+// Chi ghi key khi that su co so. Docs noi ro: cam bien loi thi BO HAN key,
+// dung gui 0 — vi mainTemp = 0 la 0 do C hop le, server khong biet la so rac.
+size_t buildBody(char *out, size_t cap)
+{
+    size_t n = 0;
+    n += snprintf(out + n, cap - n, "{");
+
+    if (pending.ts > 0)
+        n += snprintf(out + n, cap - n, "\"recordedAt\":%lld,", (long long)pending.ts);
+
+    if (pending.hasCo2)
+        n += snprintf(out + n, cap - n, "\"co2\":%d,", pending.co2);
+
+    if (pending.hasCo2Env)
+        n += snprintf(out + n, cap - n, "\"co2Temp\":%.1f,\"co2Humidity\":%.1f,",
+                      pending.co2Temp, pending.co2Hum);
+
+    if (pending.hasSht)
+        n += snprintf(out + n, cap - n, "\"mainTemp\":%.2f,\"mainHumidity\":%.2f,",
+                      pending.temp, pending.hum);
+
+    n += snprintf(out + n, cap - n, "\"rssi\":%d}", pending.rssi);
+    return n;
+}
+
+bool sendPayload()
+{
+    if (WiFi.status() != WL_CONNECTED)
+        return false;
+
+    if (!pending.hasCo2 && !pending.hasCo2Env && !pending.hasSht)
+    {
+        Serial.println("[UP] Khong co so lieu nao -> bo goi");
+        pending.active = false;
+        return true;
+    }
+
+    char body[288];
+    buildBody(body, sizeof(body));
+
+    WiFiClientSecure client;
+    // Bo kiem chung chi. Danh doi: neu co ai dung giua duong thi ho doc duoc
+    // API_KEY. Chap nhan duoc trong mang nha; muon chat hon thi thay bang
+    // client.setCACert(root_ca) voi root CA cua Cloudflare.
+    client.setInsecure();
+    client.setTimeout(10);
+
+    HTTPClient http;
+    http.setTimeout(10000);
+    http.setConnectTimeout(10000);
+
+    if (!http.begin(client, API_BASE "/api/ingest"))
+    {
+        Serial.println("[UP] http.begin that bai");
+        return false;
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-api-key", API_KEY);
+
+    int code = http.POST((uint8_t *)body, strlen(body));
+    String resp = code > 0 ? http.getString() : String();
+    http.end();
+
+    // Docs canh bao: Access tra 302 kem HTML chu khong phai loi 4xx.
+    // Kieu kiem "code > 0 la thanh cong" se bao OK trong khi chang luu gi.
+    Serial.printf("[UP] HTTP %d | %s\n", code, body);
+
+    if (code == 201)
+    {
+        if (resp.indexOf("\"rejected\":[\"") >= 0)
+            Serial.printf("[UP] SERVER BO BOT FIELD -> %s\n", resp.c_str());
+        pending.active = false;
+        return true;
+    }
+
+    if (code == 301 || code == 302 || code == 307)
+        Serial.println("[UP] Bi chuyen huong -> Cloudflare Access chua dat "
+                       "Bypass cho /api/ingest");
+    else if (code == 401)
+        Serial.println("[UP] 401 -> sai x-api-key");
+    else if (code == 422)
+        Serial.printf("[UP] 422 -> khong con gia tri nao dung duoc: %s\n", resp.c_str());
+    else if (code > 0)
+        Serial.printf("[UP] Loi %d: %s\n", code, resp.c_str());
+    else
+        Serial.printf("[UP] Khong ket noi duoc (%s)\n",
+                      http.errorToString(code).c_str());
+
+    return false;
+}
+
+void tryUpload(unsigned long now)
+{
+    if (!pending.active)
+        return;
+
+    if (pending.tries > 0 && now - lastUploadTry < UPLOAD_RETRY)
+        return;
+
+    lastUploadTry = now;
+    pending.tries++;
+
+    if (sendPayload())
+    {
+        netState = NET_SYNCED;
+        render();
+        return;
+    }
+
+    netState = WiFi.status() == WL_CONNECTED ? NET_UP : NET_DOWN;
+    render();
+
+    // Khong co NTP thi retry se de ra ban ghi trung (server chi idempotent
+    // theo recordedAt). Tha mat mot goi con hon lam ban du lieu.
+    if (pending.ts == 0)
+    {
+        Serial.println("[UP] Chua co NTP -> khong retry, bo goi nay");
+        pending.active = false;
+        return;
+    }
+
+    if (pending.tries >= UPLOAD_MAX_TRY)
+    {
+        Serial.println("[UP] Het so lan thu -> bo goi, cho nhip sau");
+        pending.active = false;
+    }
+}
+
+// ================= MAIN =================
 void setup()
 {
     Serial.begin(115200);
     delay(300);
-    Serial.println("\n[BOOT] pc-monitor v4 | BLE + giao dien dong ho");
+    Serial.println("\n[BOOT] air-monitor v2 | CO2 + nhiet do + do am + gui API");
 
-    // Gan chan cho DUNG instance SPI ma TFT_eSPI dang dung.
-    // Voi USE_HSPI_PORT, thu vien tao rieng mot SPIClass(HSPI) chu khong dung
-    // doi tuong SPI toan cuc -> phai lay qua getSPIinstance().
-    // MISO = -1 de khong chiem GPIO13 (dang lam chan DC).
-    tft.getSPIinstance().begin(TFT_SCLK, -1, TFT_MOSI, -1);
-    tft.init();
-    tft.setRotation(1);
-    drawChrome();
+    initDisplay();
 
     Wire.begin(SDA_PIN, SCL_PIN);
-    Wire.setClock(100000); // day dupont dai -> ha xuong 100kHz cho on dinh
+    Wire.setClock(100000); // SCD4x toi da 100kHz, day dupont dai cung can cham
     delay(100);
     scanI2C();
 
-    sensorOk = initSensor();
-    if (sensorOk)
+    shtOk = initSht();
+    if (shtOk)
     {
-        Serial.printf("[SHT3X] OK tai 0x%02X\n", sensorAddr);
-        readSensor();
+        Serial.printf("[SHT3X] OK tai 0x%02X\n", shtAddr);
+        readSht();
     }
     else
     {
         Serial.println("[SHT3X] Khong tim thay tai 0x44 lan 0x45!");
     }
 
-    startBLE();
+    scdOk = initScd();
+    if (!scdOk)
+        Serial.println("[SCD40] Khong tim thay tai 0x62!");
+
+    startWifi();
+    startNtp();
+
     render(true);
 
-    lastSensorRead = millis();
-    lastRetry = millis();
-    Serial.println("[TFT] san sang");
+    unsigned long now = millis();
+    lastShtRead = now;
+    lastSensorRetry = now;
+    lastCo2Ok = now;
+    lastWifiTry = now;
+    lastUpload = now;
+    Serial.println("[BOOT] san sang");
 }
 
 void loop()
 {
     unsigned long now = millis();
 
-    if (hasPending)
-    {
-        char line[sizeof(rxBuf)];
-        portENTER_CRITICAL(&rxMux);
-        strncpy(line, rxBuf, sizeof(line));
-        hasPending = false;
-        portEXIT_CRITICAL(&rxMux);
+    // ----- WiFi -----
+    bool wifiUp = WiFi.status() == WL_CONNECTED;
 
-        if (parseLine(String(line)))
+    if (!wifiUp && now - lastWifiTry >= 10000UL)
+    {
+        lastWifiTry = now;
+        Serial.println("[WIFI] Chua co ket noi -> thu lai");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        if (netState != NET_DOWN)
         {
-            lastData = now;
-            linkUp = true;
+            netState = NET_DOWN;
             render();
         }
     }
-
-    // Mat song BLE, hoac con ket noi nhung PC ngung gui -> deu coi la mat lien lac
-    if (linkUp && (!bleConnected || now - lastData > DATA_TIMEOUT))
+    else if (wifiUp && netState == NET_DOWN)
     {
-        linkUp = false;
+        Serial.printf("[WIFI] Da noi, IP %s, RSSI %d dBm\n",
+                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        netState = NET_UP;
         render();
-        Serial.println("[WARN] Mat du lieu tu PC");
     }
 
-    if (!sensorOk && now - lastRetry >= RETRY_INTERVAL)
+    // ----- CO2: hoi lien tuc, sensor tu quyet dinh khi nao co so moi (5s) -----
+    // Ghi moc thoi gian bang chinh bien `now`, KHONG dung millis() o day.
+    // millis() luon lon hon `now` mot chut -> phep tru unsigned duoi kia se
+    // tran vong thanh so khong lo va lam kich hoat nham nhanh reset.
+    if (scdOk && readScd())
     {
-        lastRetry = now;
-        if (initSensor())
+        lastCo2Ok = now;
+        Serial.printf("[SCD40] CO2 = %d ppm | %.1fC %.1f%%\n", co2, co2Temp, co2Hum);
+        render();
+    }
+
+    if (scdOk && now - lastCo2Ok > CO2_STALE)
+    {
+        Serial.println("[SCD40] Qua lau khong co du lieu -> reset ket noi");
+        scdOk = false;
+        co2 = -1;
+        co2Temp = co2Hum = NAN;
+        render();
+    }
+
+    // ----- nhiet do / do am -----
+    if (shtOk && now - lastShtRead >= SHT_INTERVAL)
+    {
+        lastShtRead = now;
+        if (readSht())
+            render();
+    }
+
+    // ----- thu ket noi lai cam bien hong -----
+    if ((!shtOk || !scdOk) && now - lastSensorRetry >= SENSOR_RETRY)
+    {
+        lastSensorRetry = now;
+
+        if (!shtOk && initSht())
         {
-            sensorOk = true;
-            Serial.printf("[SHT3X] Da ket noi lai tai 0x%02X\n", sensorAddr);
-            readSensor();
+            shtOk = true;
+            Serial.printf("[SHT3X] Da ket noi lai tai 0x%02X\n", shtAddr);
+            readSht();
+            render();
+        }
+
+        if (!scdOk && initScd())
+        {
+            scdOk = true;
+            lastCo2Ok = now;
             render();
         }
     }
 
-    if (sensorOk && now - lastSensorRead >= SENSOR_INTERVAL)
+    // ----- gui len server -----
+    if (now - lastUpload >= UPLOAD_INTERVAL)
     {
-        lastSensorRead = now;
-        if (readSensor())
-            render();
+        lastUpload = now;
+        if (pending.active)
+            Serial.println("[UP] Goi cu chua gui duoc -> ghi de bang so lieu moi");
+        snapshot();
     }
+
+    tryUpload(now);
+
+    delay(50); // khong can quay vong gap, de bus I2C va WiFi nghi mot chut
 }

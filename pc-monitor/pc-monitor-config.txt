@@ -31,10 +31,6 @@ build_flags =
     -D LOAD_GLCD
     -D LOAD_FONT2
     -D LOAD_FONT4
-    ; Font 6 = so lon 48px, Font 8 = so lon 75px. Ca hai CHI co chu so va . - :
-    ; nen don vi (C, %, ppm) phai de o nhan chu khong ghep vao chuoi so.
-    -D LOAD_FONT6
-    -D LOAD_FONT8
     -D SMOOTH_FONT
 
     ; Neu mau bi am ban -> bo comment:
@@ -44,10 +40,11 @@ build_flags =
 
 monitor_filters = esp32_exception_decoder, time
 
-; Bo BLE roi thi app nho lai nhieu, nhung giu huge_app cho khoi phai erase flash
+; BLE + TFT day len gan 1.4MB, phan vung mac dinh chi cho ~1.2MB
 board_build.partitions = huge_app.csv
 
 lib_deps =
     bodmer/TFT_eSPI@^2.5.43
     adafruit/Adafruit SHT31 Library@^2.2.2
-    sparkfun/SparkFun SCD4x Arduino Library@^1.1.2
+    ; ghim 1.4.x: NimBLE 2.x doi API callback, code duoi viet cho 1.4.x
+    h2zero/NimBLE-Arduino@^1.4.2

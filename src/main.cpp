@@ -36,6 +36,14 @@ TFT_eSPI tft = TFT_eSPI();
 #define NTP_TZ "ICT-7"        // POSIX TZ cua VN, dau am nghia la UTC+7
 #define TIME_VALID 1700000000 // moc de biet dong ho da dong bo hay chua
 
+// ---------------- hieu chuan cuong buc (FRC) ----------------
+// GPIO 0 la nut BOOT co san tren board, khong can di day gi them.
+#define BTN_PIN 0
+#define BTN_HOLD_MS 3000
+// Khong khi ngoai troi noi thanh Ha Noi thuong 450-500 ppm, cao hon con so
+// toan cau 420 vi xe co va dan cu day. Lam FRC luc sang som o ban cong.
+#define FRC_REFERENCE 450
+
 // ---------------- bang mau (RGB565) ----------------
 #define C_BG 0x0862     // #0A0E13
 #define C_CARD 0x10C4   // #141A22
@@ -322,10 +330,31 @@ void initDisplay()
     drawChrome();
 }
 
+// Hien mot dong thong bao de len giua man, dung luc chay FRC
+void showMessage(const char *line1, const char *line2, uint16_t col)
+{
+    tft.fillRoundRect(CO2_X, CO2_Y, CO2_W, CO2_H, 8, C_CARD);
+
+    tft.setTextFont(4);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(col, C_CARD);
+    tft.drawString(line1, CO2_CX, CO2_Y + 40);
+
+    tft.setTextFont(2);
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString(line2, CO2_CX, CO2_Y + 74);
+}
+
 #else // ---- khong dung man: cac ham thanh rong, code goi giu nguyen ----
 
 inline void initDisplay() {}
 inline void render(bool force = false) { (void)force; }
+inline void showMessage(const char *a, const char *b, uint16_t c)
+{
+    (void)a;
+    (void)b;
+    (void)c;
+}
 
 #endif
 
@@ -383,10 +412,17 @@ bool readSht()
 
 bool initScd()
 {
-    // Tham so thu 2 = false: begin() KHONG tu bat periodic measurement (5s/lan),
+    // Tham so 2 = false: begin() KHONG tu bat periodic measurement (5s/lan),
     // de minh tu bat che do low power (30s/lan) ngay duoi.
-    // Tham so thu 3 = true: bat tu hieu chuan ASC.
-    if (!scd4x.begin(Wire, false, true))
+    // Tham so 3 = false: TAT tu hieu chuan ASC.
+    //
+    // Vi sao tat ASC: no lay gia tri thap nhat trong tuan roi coi do la 400ppm.
+    // Phong nay dung quat thong gio, day chi xuong ~586ppm, nen ASC se tu tru
+    // di gan 190ppm khoi moi so do — sai theo huong lam minh yen tam nham.
+    // Thay bang FRC mot lan (giu nut BOOT 3 giay khi o ngoai troi).
+    //
+    // Lenh nay chi ghi vao RAM cam bien nen goi moi lan boot khong mon EEPROM.
+    if (!scd4x.begin(Wire, false, false))
         return false;
 
     // Low power periodic: 30s/lan, dong trung binh ~3.2mA thay vi ~15mA.
@@ -397,8 +433,60 @@ bool initScd()
         return false;
     }
 
-    Serial.println("[SCD40] OK tai 0x62, low power 30s/lan, cho so dau tien...");
+    Serial.println("[SCD40] OK tai 0x62, low power 30s/lan, ASC tat, "
+                   "cho so dau tien...");
     return true;
+}
+
+// Hieu chuan cuong buc. Chay khi dang o ngoai troi, da de on dinh >= 5 phut,
+// va khong co ai tho gan cam bien.
+void runFrc()
+{
+    if (!scdOk)
+    {
+        Serial.println("[FRC] Cam bien chua san sang -> bo qua");
+        return;
+    }
+
+    Serial.printf("[FRC] Bat dau, gia tri tham chieu %d ppm\n", FRC_REFERENCE);
+    showMessage("DANG HIEU CHUAN", "dung tho vao cam bien", C_AMBER);
+
+    // Phai ve che do idle truoc. Lenh stop can 500ms moi co hieu luc.
+    scd4x.stopPeriodicMeasurement();
+    delay(600);
+
+    float correction = 0;
+    bool ok = scd4x.performForcedRecalibration(FRC_REFERENCE, &correction);
+
+    if (ok)
+    {
+        // Ghi vao EEPROM de song qua moi lan mat dien.
+        // EEPROM chi chiu khoang 2000 lan ghi nen CHI goi o day, khong goi
+        // trong initScd().
+        scd4x.persistSettings();
+        delay(800);
+
+        Serial.printf("[FRC] Xong. Do lech da bu: %.1f ppm\n", correction);
+
+        char buf[32];
+        snprintf(buf, sizeof(buf), "lech %.0f ppm", correction);
+        showMessage("HIEU CHUAN XONG", buf, C_GREEN);
+    }
+    else
+    {
+        Serial.println("[FRC] That bai — cam bien tu choi lenh");
+        showMessage("HIEU CHUAN LOI", "thu lai sau vai giay", C_RED);
+    }
+
+    delay(3000);
+
+    // Bat lai che do do binh thuong
+    scd4x.startLowPowerPeriodicMeasurement();
+    co2 = -1;
+    co2Temp = co2Hum = NAN;
+    prevCo2 = -2; // ep ve lai o CO2 vi vua bi showMessage de len
+    lastCo2Ok = millis();
+    render(true);
 }
 
 bool readScd()
@@ -604,6 +692,9 @@ void setup()
 
     initDisplay();
 
+    // Nut BOOT co san tren board, noi san xuong GND khi bam -> dung pull-up.
+    pinMode(BTN_PIN, INPUT_PULLUP);
+
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(100000); // SCD4x toi da 100kHz, day dupont dai cung can cham
     delay(100);
@@ -641,6 +732,28 @@ void setup()
 void loop()
 {
     unsigned long now = millis();
+
+    // ----- nut BOOT: giu 3 giay de chay hieu chuan cuong buc -----
+    static unsigned long btnDownAt = 0;
+    static bool btnFired = false;
+    bool btnDown = digitalRead(BTN_PIN) == LOW;
+
+    if (!btnDown)
+    {
+        btnDownAt = 0;
+        btnFired = false;
+    }
+    else
+    {
+        if (btnDownAt == 0)
+            btnDownAt = now;
+        else if (!btnFired && now - btnDownAt >= BTN_HOLD_MS)
+        {
+            btnFired = true; // chi chay mot lan cho moi lan giu
+            runFrc();
+            now = millis(); // runFrc ton vai giay, lay lai moc thoi gian
+        }
+    }
 
     // ----- WiFi -----
     bool wifiUp = WiFi.status() == WL_CONNECTED;
